@@ -926,4 +926,423 @@ signal_service = SignalService()
 
 ---
 
-> 📖 **다음**: [9장 Part 3에서는 라우터, 메인 앱, 실행 방법을 완성합니다]
+## 9.13 `app/routers/webhook.py` - Webhook 수신 라우터
+
+```python
+"""
+TradingView Webhook 수신 라우터
+"""
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.core.security import verify_webhook_secret
+from app.database import get_db
+from app.models.order import OrderLog
+from app.schemas.alert import AlertResponse, TradingViewAlert
+from app.services.signal import signal_service
+
+router = APIRouter(prefix="/webhook", tags=["webhook"])
+
+
+def _is_duplicate(db: Session, alert: TradingViewAlert) -> bool:
+    """60초 이내 동일 신호인지 확인"""
+    cutoff = datetime.utcnow() - timedelta(seconds=60)
+    exists = (
+        db.query(OrderLog)
+        .filter(
+            OrderLog.strategy == alert.strategy,
+            OrderLog.symbol == alert.symbol,
+            OrderLog.action == alert.action,
+            OrderLog.received_at >= cutoff,
+        )
+        .first()
+    )
+    return exists is not None
+
+
+@router.post("", response_model=AlertResponse)
+async def receive_webhook(
+    alert: TradingViewAlert,
+    db: Session = Depends(get_db),
+) -> AlertResponse:
+    """TradingView Alert 수신"""
+
+    # 1. Secret 검증
+    if not verify_webhook_secret(alert.secret):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid webhook secret",
+        )
+
+    # 2. 중복 체크
+    if _is_duplicate(db, alert):
+        return AlertResponse(
+            status="ignored",
+            message="Duplicate signal within 60s",
+            received_at=datetime.utcnow(),
+        )
+
+    # 3. 신호 처리 실행
+    log = await signal_service.handle_alert(alert, db)
+
+    return AlertResponse(
+        status="success" if log.executed else "error",
+        message=log.error_message or f"{alert.action} {alert.symbol} executed",
+        order_id=log.id,
+        received_at=log.received_at,
+    )
+```
+
+---
+
+## 9.14 `app/routers/orders.py` - 수동 주문 API
+
+```python
+"""
+수동 주문 및 주문 내역 조회 API
+"""
+from __future__ import annotations
+
+from typing import Literal
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models.order import OrderLog
+from app.services.signal import signal_service
+from app.schemas.alert import TradingViewAlert
+
+router = APIRouter(prefix="/orders", tags=["orders"])
+
+
+class ManualOrder(BaseModel):
+    """수동 주문 요청"""
+
+    exchange: Literal["UPBIT", "KIS"]
+    symbol: str
+    action: Literal["BUY", "SELL", "CLOSE"]
+    quantity_pct: float = Field(default=10.0, ge=0.0, le=100.0)
+
+
+@router.post("/manual")
+async def manual_order(
+    order: ManualOrder,
+    db: Session = Depends(get_db),
+) -> dict:
+    """수동 주문 실행 (테스트/관리용)"""
+    from app.core.config import get_settings
+
+    settings = get_settings()
+
+    # 내부적으로 TradingViewAlert 형태로 변환
+    alert = TradingViewAlert(
+        secret=settings.webhook_secret,
+        strategy="manual",
+        symbol=order.symbol,
+        exchange=order.exchange,
+        action=order.action,
+        price=0.0 or 1.0,  # 수동 주문은 price 무관 (버그 방지용 1.0)
+        quantity_pct=order.quantity_pct,
+    )
+
+    log = await signal_service.handle_alert(alert, db)
+    return {
+        "order_id": log.id,
+        "executed": log.executed,
+        "error": log.error_message,
+    }
+
+
+@router.get("/history")
+async def get_order_history(
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """주문 내역 조회"""
+    logs = (
+        db.query(OrderLog)
+        .order_by(OrderLog.received_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": log.id,
+            "strategy": log.strategy,
+            "symbol": log.symbol,
+            "exchange": log.exchange,
+            "action": log.action,
+            "signal_price": log.signal_price,
+            "executed": log.executed,
+            "received_at": log.received_at.isoformat(),
+            "executed_at": log.executed_at.isoformat() if log.executed_at else None,
+            "error_message": log.error_message,
+        }
+        for log in logs
+    ]
+```
+
+---
+
+## 9.15 `app/routers/status.py` - 시스템 상태 라우터
+
+```python
+"""
+시스템 상태 및 잔고 조회 API
+"""
+from __future__ import annotations
+
+from fastapi import APIRouter
+
+from app.core.config import get_settings
+from app.services.signal import signal_service
+
+router = APIRouter(prefix="/status", tags=["status"])
+
+
+@router.get("/")
+async def health_check() -> dict:
+    """헬스체크"""
+    settings = get_settings()
+    return {
+        "status": "ok",
+        "app_name": settings.app_name,
+        "env": settings.app_env,
+        "kis_mode": settings.kis_mode,
+    }
+
+
+@router.get("/balance/upbit")
+async def upbit_balance() -> dict:
+    """업비트 잔고 조회"""
+    try:
+        broker = await signal_service.get_upbit()
+        krw = await broker.get_krw_balance()
+        return {"krw_balance": krw}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@router.get("/balance/kis")
+async def kis_balance() -> dict:
+    """KIS 예수금 조회"""
+    try:
+        broker = await signal_service.get_kis()
+        cash = await broker.get_cash_balance()
+        return {"cash": cash}
+    except Exception as e:
+        return {"error": str(e)}
+```
+
+---
+
+## 9.16 `app/main.py` - FastAPI 메인 앱
+
+```python
+"""
+FastAPI 메인 애플리케이션
+"""
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from fastapi import FastAPI
+
+from app.core.config import get_settings
+from app.database import SessionLocal, init_db
+from app.routers import orders, status, webhook
+from app.services.notify import send_telegram_message
+from app.services.signal import signal_service
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+scheduler = AsyncIOScheduler()
+
+
+async def daily_report_job() -> None:
+    """매일 오후 6시 잔고 리포트"""
+    try:
+        upbit = await signal_service.get_upbit()
+        krw = await upbit.get_krw_balance()
+
+        report = f"📊 <b>일일 리포트</b>\n원화 잔고: {krw:,.0f} KRW"
+        await send_telegram_message(report)
+    except Exception as e:
+        logger.error(f"일일 리포트 실패: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """앱 시작/종료 시 실행할 작업"""
+    # 시작
+    logger.info("앱 초기화 시작")
+    init_db()
+
+    # APScheduler 등록
+    scheduler.add_job(
+        daily_report_job,
+        CronTrigger(hour=18, minute=0),  # 매일 18:00
+        id="daily_report",
+    )
+    scheduler.start()
+    logger.info("스케줄러 시작됨")
+
+    # 시작 알림
+    await send_telegram_message("🚀 자동매매 봇이 시작되었습니다.")
+
+    yield
+
+    # 종료
+    scheduler.shutdown()
+    if signal_service.kis:
+        await signal_service.kis.close()
+    await send_telegram_message("🛑 자동매매 봇이 종료되었습니다.")
+    logger.info("앱 종료")
+
+
+settings = get_settings()
+
+app = FastAPI(
+    title=settings.app_name,
+    version="1.0.0",
+    debug=settings.debug,
+    lifespan=lifespan,
+)
+
+# 라우터 등록
+app.include_router(webhook.router)
+app.include_router(orders.router)
+app.include_router(status.router)
+
+
+@app.get("/")
+async def root() -> dict[str, str]:
+    return {"message": f"{settings.app_name} is running"}
+```
+
+---
+
+## 9.17 서버 실행 방법
+
+### 9.17.1 패키지 설치
+
+```bash
+# uv로 프로젝트 초기화
+uv init
+uv add fastapi uvicorn pydantic pydantic-settings sqlalchemy httpx \
+       pyupbit apscheduler python-dotenv
+
+# 또는 pip
+pip install fastapi uvicorn pydantic pydantic-settings sqlalchemy httpx \
+            pyupbit apscheduler python-dotenv
+```
+
+### 9.17.2 `.env` 파일 생성
+
+```bash
+cp .env.example .env
+# .env 파일을 편집하여 실제 API 키 입력
+```
+
+### 9.17.3 Uvicorn으로 실행
+
+```bash
+# 개발 모드 (코드 변경 시 자동 재시작)
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+# 프로덕션 모드
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+```
+
+### 9.17.4 접속 확인
+
+- **API 문서**: http://localhost:8000/docs
+- **상태 확인**: http://localhost:8000/status/
+- **수동 주문**: http://localhost:8000/docs → `/orders/manual`
+
+### 9.17.5 Webhook URL 설정
+
+TradingView Alert 설정 시:
+- **Webhook URL**: `https://your-domain.com/webhook`
+- **Message**: 7장에서 배운 JSON 포맷
+
+> 💡 **로컬 테스트 팁**
+> 로컬에서 TradingView Webhook을 받으려면 ngrok을 사용하세요:
+> ```bash
+> ngrok http 8000
+> ```
+> 발급된 HTTPS URL + `/webhook`을 TradingView에 입력합니다.
+
+---
+
+## 9.18 전체 흐름 테스트
+
+### 테스트 시나리오
+
+1. **서버 시작**: `uvicorn app.main:app --reload`
+2. **텔레그램 알림 확인**: "🚀 자동매매 봇 시작" 메시지 수신
+3. **상태 조회**: http://localhost:8000/status/
+4. **수동 주문 테스트**: `/docs`에서 `/orders/manual` 호출
+5. **Webhook 테스트**: curl로 POST 전송
+
+### curl 테스트 명령어
+
+```bash
+curl -X POST http://localhost:8000/webhook \
+  -H "Content-Type: application/json" \
+  -d '{
+    "secret": "your-webhook-secret",
+    "strategy": "manual_test",
+    "symbol": "KRW-BTC",
+    "exchange": "UPBIT",
+    "action": "BUY",
+    "price": 60000000,
+    "quantity_pct": 1
+  }'
+```
+
+### 예상 결과
+
+1. FastAPI 콘솔에 로그 출력
+2. DB에 `OrderLog` 저장
+3. 업비트 API로 실제 매수 주문
+4. 텔레그램 알림 수신
+5. 응답으로 `{"status":"success","order_id":1,...}` 반환
+
+---
+
+## 9.19 9장 요약
+
+- FastAPI 기반 자동매매 서버를 완전한 형태로 구축했습니다.
+- **계층 분리**: `core`(설정/보안), `services`(브로커/알림/신호), `routers`(API), `models`/`schemas`(데이터)
+- **비동기 처리**: `httpx`, `async/await`로 블로킹 최소화
+- **APScheduler**: 정기 리포트 자동 실행
+- **텔레그램 알림**: 매매 체결 및 에러 실시간 통보
+- **Secret Token + 중복 방지**: Webhook 보안
+- **다음 장에서는 백테스팅**으로 전략의 과거 성과를 검증합니다.
+
+> ⚠️ **실전 투입 전 체크리스트**
+> - [ ] `.env` 파일이 `.gitignore`에 포함되어 있는가?
+> - [ ] Webhook Secret이 충분히 강력한가?
+> - [ ] KIS는 `paper` 모드로 시작하는가?
+> - [ ] 업비트는 **출금 권한이 비활성화**되어 있는가?
+> - [ ] 소액 매매로 충분히 테스트했는가?
+> - [ ] 텔레그램 알림이 정상 작동하는가?
+
+---
+
+> 📖 **다음 장**: [10장. 백테스팅 시스템 구축](./10_백테스팅_시스템.md)
