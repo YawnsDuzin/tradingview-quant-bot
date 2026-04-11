@@ -440,4 +440,490 @@ def get_db() -> Generator[Session, None, None]:
 
 ---
 
-> 📖 **다음**: [9장 Part 2에서는 브로커 서비스, 알림, 메인 앱, 라우터를 구현합니다]
+## 9.9 `app/services/upbit_broker.py` - 업비트 브로커 서비스
+
+```python
+"""
+업비트 매매 실행 서비스 (async 래퍼)
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+import pyupbit
+
+from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+class UpbitBroker:
+    """업비트 비동기 브로커"""
+
+    MIN_ORDER_KRW = 5000
+
+    def __init__(self) -> None:
+        settings = get_settings()
+        if not settings.upbit_access_key or not settings.upbit_secret_key:
+            raise ValueError("UPBIT API 키가 설정되지 않았습니다.")
+        self.client = pyupbit.Upbit(
+            settings.upbit_access_key,
+            settings.upbit_secret_key,
+        )
+
+    async def _run(self, func, *args, **kwargs):
+        """동기 함수를 비동기로 실행 (pyupbit은 동기 라이브러리)"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
+    async def get_krw_balance(self) -> float:
+        """원화 잔고 조회"""
+        balance = await self._run(self.client.get_balance, "KRW")
+        return float(balance) if balance else 0.0
+
+    async def get_coin_balance(self, symbol: str) -> float:
+        """코인 보유 수량 조회 (symbol: KRW-BTC)"""
+        coin = symbol.split("-")[1] if "-" in symbol else symbol
+        balance = await self._run(self.client.get_balance, coin)
+        return float(balance) if balance else 0.0
+
+    async def get_current_price(self, symbol: str) -> float:
+        """현재가 조회"""
+        price = await self._run(pyupbit.get_current_price, symbol)
+        return float(price) if price else 0.0
+
+    async def buy_market_pct(
+        self,
+        symbol: str,
+        pct: float,
+    ) -> dict[str, Any] | None:
+        """
+        원화 잔고의 일정 비율로 시장가 매수
+
+        Args:
+            symbol: "KRW-BTC" 형식
+            pct: 매수 비율 (0.0 ~ 1.0)
+        """
+        krw = await self.get_krw_balance()
+        amount = krw * pct
+
+        if amount < self.MIN_ORDER_KRW:
+            logger.warning(f"매수 금액 부족: {amount:,.0f} KRW")
+            return None
+
+        try:
+            result = await self._run(
+                self.client.buy_market_order,
+                symbol,
+                amount * 0.9995,  # 수수료 반영
+            )
+            logger.info(f"[UPBIT BUY] {symbol} @ {amount:,.0f} KRW")
+            return result
+        except Exception as e:
+            logger.error(f"[UPBIT BUY] 실패: {e}")
+            return None
+
+    async def sell_market_all(self, symbol: str) -> dict[str, Any] | None:
+        """보유 전량 시장가 매도"""
+        volume = await self.get_coin_balance(symbol)
+        if volume <= 0:
+            logger.warning(f"[UPBIT SELL] {symbol} 보유 수량 없음")
+            return None
+
+        current_price = await self.get_current_price(symbol)
+        if volume * current_price < self.MIN_ORDER_KRW:
+            logger.warning(f"[UPBIT SELL] 금액 부족")
+            return None
+
+        try:
+            result = await self._run(
+                self.client.sell_market_order,
+                symbol,
+                volume,
+            )
+            logger.info(f"[UPBIT SELL] {symbol} x {volume}")
+            return result
+        except Exception as e:
+            logger.error(f"[UPBIT SELL] 실패: {e}")
+            return None
+```
+
+---
+
+## 9.10 `app/services/kis_broker.py` - KIS 브로커 서비스
+
+```python
+"""
+한국투자증권 KIS API 매매 서비스
+"""
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timedelta
+from typing import Any, Literal
+
+import httpx
+
+from app.core.config import Settings, get_settings
+
+logger = logging.getLogger(__name__)
+
+OrderSide = Literal["BUY", "SELL"]
+
+
+class KISBroker:
+    """한국투자증권 KIS API 비동기 브로커"""
+
+    def __init__(self) -> None:
+        self.settings: Settings = get_settings()
+        self._access_token: str | None = None
+        self._token_expires_at: datetime | None = None
+        self._client = httpx.AsyncClient(timeout=10.0)
+
+    async def close(self) -> None:
+        """HTTP 클라이언트 정리"""
+        await self._client.aclose()
+
+    async def _get_access_token(self) -> str:
+        """Access Token 발급/재사용"""
+        if (
+            self._access_token
+            and self._token_expires_at
+            and self._token_expires_at > datetime.now() + timedelta(minutes=5)
+        ):
+            return self._access_token
+
+        url = f"{self.settings.kis_base_url}/oauth2/tokenP"
+        headers = {"content-type": "application/json"}
+        body = {
+            "grant_type": "client_credentials",
+            "appkey": self.settings.kis_app_key,
+            "appsecret": self.settings.kis_app_secret,
+        }
+
+        resp = await self._client.post(url, headers=headers, content=json.dumps(body))
+        resp.raise_for_status()
+        data = resp.json()
+
+        self._access_token = data["access_token"]
+        self._token_expires_at = datetime.now() + timedelta(
+            seconds=data.get("expires_in", 86400)
+        )
+        return self._access_token  # type: ignore
+
+    async def _auth_headers(self, tr_id: str) -> dict[str, str]:
+        """공통 인증 헤더"""
+        token = await self._get_access_token()
+        return {
+            "content-type": "application/json; charset=utf-8",
+            "authorization": f"Bearer {token}",
+            "appkey": self.settings.kis_app_key,
+            "appsecret": self.settings.kis_app_secret,
+            "tr_id": tr_id,
+        }
+
+    async def get_price(self, stock_code: str) -> int:
+        """국내 주식 현재가 조회"""
+        url = f"{self.settings.kis_base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
+        headers = await self._auth_headers("FHKST01010100")
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+        }
+        resp = await self._client.get(url, headers=headers, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        if data["rt_cd"] != "0":
+            raise RuntimeError(f"시세 조회 실패: {data['msg1']}")
+        return int(data["output"]["stck_prpr"])
+
+    async def get_cash_balance(self) -> int:
+        """예수금 조회"""
+        url = f"{self.settings.kis_base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+        prefix = "V" if self.settings.kis_mode == "paper" else "T"
+        headers = await self._auth_headers(f"{prefix}TTC8434R")
+        params = {
+            "CANO": self.settings.kis_cano,
+            "ACNT_PRDT_CD": self.settings.kis_acnt_prdt_cd,
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "",
+            "INQR_DVSN": "02",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "01",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        resp = await self._client.get(url, headers=headers, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        if data["rt_cd"] != "0":
+            raise RuntimeError(f"잔고 조회 실패: {data['msg1']}")
+        summary = data["output2"][0] if data["output2"] else {}
+        return int(summary.get("dnca_tot_amt", 0))
+
+    async def place_order(
+        self,
+        stock_code: str,
+        side: OrderSide,
+        quantity: int,
+        price: int = 0,
+        market: bool = True,
+    ) -> dict[str, Any]:
+        """주식 주문 실행"""
+        url = f"{self.settings.kis_base_url}/uapi/domestic-stock/v1/trading/order-cash"
+
+        prefix = "V" if self.settings.kis_mode == "paper" else "T"
+        tr_id = f"{prefix}TTC0802U" if side == "BUY" else f"{prefix}TTC0801U"
+
+        headers = await self._auth_headers(tr_id)
+        body = {
+            "CANO": self.settings.kis_cano,
+            "ACNT_PRDT_CD": self.settings.kis_acnt_prdt_cd,
+            "PDNO": stock_code,
+            "ORD_DVSN": "01" if market else "00",
+            "ORD_QTY": str(quantity),
+            "ORD_UNPR": "0" if market else str(price),
+        }
+
+        resp = await self._client.post(url, headers=headers, content=json.dumps(body))
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data["rt_cd"] != "0":
+            raise RuntimeError(f"주문 실패: {data['msg1']}")
+
+        return {
+            "order_no": data["output"]["ODNO"],
+            "order_time": data["output"]["ORD_TMD"],
+            "message": data["msg1"],
+        }
+
+    async def buy_by_krw(
+        self,
+        stock_code: str,
+        krw_amount: int,
+    ) -> dict[str, Any] | None:
+        """원화 금액 기준 시장가 매수 (수량 자동 계산)"""
+        price = await self.get_price(stock_code)
+        quantity = krw_amount // price
+        if quantity <= 0:
+            logger.warning(f"매수 수량 0: price={price}, krw={krw_amount}")
+            return None
+        return await self.place_order(stock_code, "BUY", int(quantity), market=True)
+```
+
+---
+
+## 9.11 `app/services/notify.py` - 텔레그램 알림
+
+```python
+"""
+텔레그램 알림 서비스
+"""
+from __future__ import annotations
+
+import logging
+
+import httpx
+
+from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+async def send_telegram_message(text: str, parse_mode: str = "HTML") -> bool:
+    """
+    텔레그램 메시지 전송
+
+    Args:
+        text: 메시지 본문 (HTML 태그 사용 가능)
+        parse_mode: "HTML" 또는 "Markdown"
+
+    Returns:
+        전송 성공 여부
+    """
+    settings = get_settings()
+    if not settings.telegram_bot_token or not settings.telegram_chat_id:
+        logger.warning("텔레그램 설정이 없어 알림을 건너뜁니다.")
+        return False
+
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
+    payload = {
+        "chat_id": settings.telegram_chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            return True
+    except Exception as e:
+        logger.error(f"텔레그램 전송 실패: {e}")
+        return False
+
+
+async def notify_trade(
+    action: str,
+    symbol: str,
+    price: float,
+    quantity: float | None = None,
+    strategy: str = "",
+) -> None:
+    """매매 체결 알림"""
+    emoji = "🟢" if action == "BUY" else "🔴"
+    qty_str = f"\n수량: {quantity}" if quantity else ""
+    text = (
+        f"{emoji} <b>{action}</b> 체결\n"
+        f"종목: {symbol}\n"
+        f"가격: {price:,.0f}{qty_str}\n"
+        f"전략: {strategy}"
+    )
+    await send_telegram_message(text)
+
+
+async def notify_error(title: str, detail: str) -> None:
+    """에러 알림"""
+    text = f"⚠️ <b>{title}</b>\n\n<code>{detail}</code>"
+    await send_telegram_message(text)
+```
+
+---
+
+## 9.12 `app/services/signal.py` - 신호 처리 서비스
+
+```python
+"""
+Alert 신호 파싱 및 매매 실행 분기
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+
+from sqlalchemy.orm import Session
+
+from app.models.order import OrderLog
+from app.schemas.alert import TradingViewAlert
+from app.services.kis_broker import KISBroker
+from app.services.notify import notify_error, notify_trade
+from app.services.upbit_broker import UpbitBroker
+
+logger = logging.getLogger(__name__)
+
+
+class SignalService:
+    """TradingView 신호를 거래소 주문으로 실행"""
+
+    def __init__(self) -> None:
+        self.upbit: UpbitBroker | None = None
+        self.kis: KISBroker | None = None
+
+    async def get_upbit(self) -> UpbitBroker:
+        if self.upbit is None:
+            self.upbit = UpbitBroker()
+        return self.upbit
+
+    async def get_kis(self) -> KISBroker:
+        if self.kis is None:
+            self.kis = KISBroker()
+        return self.kis
+
+    async def handle_alert(
+        self,
+        alert: TradingViewAlert,
+        db: Session,
+    ) -> OrderLog:
+        """
+        Alert 처리 메인 진입점
+
+        1. 로그 저장
+        2. 거래소별 분기
+        3. 매매 실행
+        4. 결과 업데이트
+        5. 알림 발송
+        """
+        # 1. 주문 로그 저장
+        log = OrderLog(
+            strategy=alert.strategy,
+            symbol=alert.symbol,
+            exchange=alert.exchange,
+            action=alert.action,
+            signal_price=alert.price,
+            quantity_pct=alert.quantity_pct,
+        )
+        db.add(log)
+        db.commit()
+        db.refresh(log)
+
+        # 2. 거래소별 분기 실행
+        try:
+            if alert.exchange == "UPBIT":
+                result = await self._execute_upbit(alert)
+            elif alert.exchange == "KIS":
+                result = await self._execute_kis(alert)
+            else:
+                raise ValueError(f"지원하지 않는 거래소: {alert.exchange}")
+
+            # 3. 결과 반영
+            if result:
+                log.executed = True
+                log.executed_at = datetime.utcnow()
+                log.order_uuid = str(result.get("order_no") or result.get("uuid", ""))
+                db.commit()
+
+                # 4. 텔레그램 알림
+                await notify_trade(
+                    action=alert.action,
+                    symbol=alert.symbol,
+                    price=alert.price,
+                    strategy=alert.strategy,
+                )
+        except Exception as e:
+            logger.exception("신호 처리 실패")
+            log.error_message = str(e)
+            db.commit()
+            await notify_error("매매 실행 실패", str(e))
+
+        return log
+
+    async def _execute_upbit(self, alert: TradingViewAlert) -> dict | None:
+        """업비트 매매 실행"""
+        broker = await self.get_upbit()
+        pct = alert.quantity_pct / 100.0
+
+        if alert.action == "BUY":
+            return await broker.buy_market_pct(alert.symbol, pct)
+        elif alert.action in ("SELL", "CLOSE"):
+            return await broker.sell_market_all(alert.symbol)
+        return None
+
+    async def _execute_kis(self, alert: TradingViewAlert) -> dict | None:
+        """KIS 주식 매매 실행"""
+        broker = await self.get_kis()
+
+        if alert.action == "BUY":
+            # 전체 예수금의 일정 비율
+            cash = await broker.get_cash_balance()
+            target_amount = int(cash * alert.quantity_pct / 100.0)
+            return await broker.buy_by_krw(alert.symbol, target_amount)
+
+        # SELL/CLOSE는 별도 수량 조회 로직 필요 (보유 수량 전량 매도)
+        # 간단화를 위해 본 예제에서는 BUY만 처리. 실전에서는 잔고 조회 필요.
+        logger.warning("KIS SELL/CLOSE는 보유 수량 조회 로직 구현 필요")
+        return None
+
+
+# 싱글톤 인스턴스
+signal_service = SignalService()
+```
+
+---
+
+> 📖 **다음**: [9장 Part 3에서는 라우터, 메인 앱, 실행 방법을 완성합니다]
